@@ -20,7 +20,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
     private static final WeakHashMap<View,Artwork> cache=new WeakHashMap<>();
     // Angles begin at the right and advance clockwise in Android's local canvas.
     private static final SweepGradient RING=new SweepGradient(0,0,
-        new int[]{0xff8171ee,0xff54c9e8,0xff6092f0,0xff5e88ef,0xff54b8e9,0xff54c9e8,0xff8171ef,0xff8171ee},
+        new int[]{0xff8973ee,0xff54cce9,0xff6594ef,0xff6590ed,0xff53bee5,0xff58c9ed,0xff8078ef,0xff8973ee},
         new float[]{0,.125f,.25f,.375f,.5f,.625f,.75f,1});
     private static final class Artwork {
         final Bitmap source, bright, idle;
@@ -36,7 +36,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
             Canvas c=new Canvas(b); Paint p=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
             c.drawBitmap(source,0,0,p);
             if(active)p.setShader(new LinearGradient(0,h,w*.55f,0,0xff58b8f7,0xff8271f2,Shader.TileMode.CLAMP));
-            else p.setColor(0xff44444a);
+            else p.setColor(0xff303036);
             p.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_IN));
             c.drawRect(0,0,w,h,p);
             return b;
@@ -48,10 +48,11 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
         f.setAccessible(true);return f;
     }
     private static final class Fields {
-        final Field state,auth,bitmap,icon,ready,progress,owner,display,talkback,register,percent,title;
+        final Field state,auth,bitmap,icon,ready,progress,owner,display,talkback,register,percent,title,width,height,corner;
         Fields(Class<?> frame,Class<?> activity)throws Exception{
             state=field(frame,"mState",int.class);auth=field(frame,"mIsAuthMode",boolean.class);
             bitmap=field(frame,"mBmpFingerIcon",Bitmap.class);
+            width=field(frame,"mFrameWidth",float.class);height=field(frame,"mFrameHeight",float.class);corner=field(frame,"mGuideFrameCornerSize",float.class);
             icon=field(frame,"mPntFingerIcon",Paint.class);
             ready=field(frame,"mPntGuideFrameReady",Paint.class);
             progress=field(frame,"mPntGuideFrameProgress",Paint.class);
@@ -66,13 +67,16 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
     private static final class Pass {
         final Paint icon,ready,progress,oldIcon,oldReady,oldProgress;
         final Bitmap original;
+        final float width,height,corner;
         Pass(Fields f,View v)throws Exception{
             icon=(Paint)f.icon.get(v);ready=(Paint)f.ready.get(v);progress=(Paint)f.progress.get(v);
             oldIcon=new Paint(icon);oldReady=new Paint(ready);oldProgress=new Paint(progress);
             original=(Bitmap)f.bitmap.get(v);
+            width=f.width.getFloat(v);height=f.height.getFloat(v);corner=f.corner.getFloat(v);
         }
         void restore(Fields f,View v)throws Exception{
             icon.set(oldIcon);ready.set(oldReady);progress.set(oldProgress);
+            f.width.setFloat(v,width);f.height.setFloat(v,height);f.corner.setFloat(v,corner);
             if(original!=null&&f.bitmap.get(v)!=original)f.bitmap.set(v,original);
         }
     }
@@ -100,17 +104,21 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                         // State 4: native completion check, deliberately never touched.
                         if(state<0||state>=4)return;
                         pass=new Pass(f,v);p.setObjectExtra("theme-pass",pass);
+                        // Native path math uses these fields only during drawing. Touch geometry is not changed.
+                        float diameter=Math.min(pass.width,pass.height);
+                        if(!Float.isFinite(diameter)||diameter<12)throw new IllegalStateException("invalid guide size");
+                        f.width.setFloat(v,diameter);f.height.setFloat(v,diameter);f.corner.setFloat(v,diameter);
                         int readyAlpha=pass.ready.getAlpha();
-                        pass.ready.setColor(0xff24242a);pass.ready.setAlpha(readyAlpha);
+                        pass.ready.setColor(0xff111116);pass.ready.setAlpha(readyAlpha);
                         int progressAlpha=pass.progress.getAlpha();
                         pass.progress.setShader(RING);pass.progress.setAlpha(progressAlpha);
                         // Subtle luminous edge without changing Samsung's path, stroke width or timing.
-                        float blur=Math.max(.5f,pass.progress.getStrokeWidth()*.23f);
+                        float blur=Math.max(1f,pass.progress.getStrokeWidth()*.42f);
                         pass.progress.setShadowLayer(blur,0,0,0x665f83ee);
                         if(pass.original!=null){
                             Artwork art=cache.get(v);
                             if(art==null||art.source!=pass.original){art=new Artwork(pass.original);cache.put(v,art);}
-                            f.bitmap.set(v,state==1?art.bright:art.idle);
+                            f.bitmap.set(v,state==2?art.bright:art.idle);
                             pass.icon.setColorFilter(null);
                         }
                         // Original onDraw executes once, including all native timers, progress,
@@ -133,7 +141,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                         if(!f.display.getBoolean(a)||f.talkback.getBoolean(a)||f.owner.get(a)==null)return;
                         if((a.getResources().getConfiguration().uiMode&Configuration.UI_MODE_NIGHT_MASK)!=Configuration.UI_MODE_NIGHT_YES)return;
                         View screen=(View)f.register.get(a);if(screen!=null)screen.setBackgroundColor(Color.BLACK);
-                        TextView percent=(TextView)f.percent.get(a);if(percent!=null)percent.setTextColor(Color.WHITE);
+                        TextView percent=(TextView)f.percent.get(a);if(percent!=null){percent.setTextColor(Color.WHITE);percent.setTypeface(Typeface.create("sans-serif",Typeface.BOLD_ITALIC));}
                         TextView title=(TextView)f.title.get(a);if(title!=null)title.setTextColor(Color.WHITE);
                     }catch(Throwable t){XposedBridge.log(TAG+"background left native: "+t);}
                 }

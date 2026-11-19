@@ -3,6 +3,9 @@ package dev.fppulse;
 import android.app.Activity;
 import android.content.res.Configuration;
 import android.graphics.*;
+import android.os.SystemClock;
+import java.lang.reflect.Method;
+import java.util.HashSet;
 import android.view.View;
 import android.widget.TextView;
 import java.lang.reflect.Field;
@@ -18,6 +21,91 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
     private static final String BASE=PKG+".fingerprint.enroll.";
     private static final String TAG="FingerprintPulse native theme: ";
     private static final WeakHashMap<View,Artwork> cache=new WeakHashMap<>();
+    private static final WeakHashMap<View,DotHalo> halos=new WeakHashMap<>();
+    private static final ThreadLocal<Pass> drawing=new ThreadLocal<>();
+    private static boolean haloAvailable;
+    private static boolean haloFailed;
+    private static final class DotHalo {
+        private static final int SIZE=384;
+        private final Bitmap rest=texture(false), ring=texture(true);
+        private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
+        private final RectF bounds=new RectF();
+        private long last;
+        private float expansion;
+        private static Bitmap texture(boolean annulus) {
+            Bitmap b=Bitmap.createBitmap(SIZE,SIZE,Bitmap.Config.ARGB_8888);
+            Canvas c=new Canvas(b);
+            Paint p=new Paint(Paint.ANTI_ALIAS_FLAG);
+            // Fine staggered dot grid, not a solid blur; soft radial alpha envelope.
+            for(int y=-180;y<=180;y+=7){
+                for(int x=-180;x<=180;x+=7){
+                    float xx=x+((y/7&1)!=0?3.5f:0f), yy=y;
+                    float d=(float)Math.hypot(xx,yy)/160f;
+                    float a;
+                    if(annulus){
+                        float v=(d-.91f)/.085f;
+                        a=(float)Math.exp(-v*v*.5f);
+                    }else{
+                        float v=d/.53f;
+                        a=(float)Math.exp(-v*v*1.8f)*Math.max(0f,1f-d);
+                    }
+                    if(a<.025f||d>1.12f)continue;
+                    int strength=Math.round((annulus?112f:85f)*a);
+                    p.setColor(Color.argb(strength,160,165,178));
+                    c.drawCircle(SIZE/2f+xx,SIZE/2f+yy,annulus?1.05f:1.1f,p);
+                }
+            }
+            return b;
+        }
+        void draw(Canvas c,float radius,boolean active,float progress){
+            long now=SystemClock.uptimeMillis();
+            float dt=last==0?16f:Math.min(48f,Math.max(1f,now-last));
+            last=now;
+            float target=active?1f:0f;
+            expansion+=(target-expansion)*(1f-(float)Math.exp(-dt/(active?58f:82f)));
+            if(Math.abs(target-expansion)<.005f)expansion=target;
+            float q=Math.max(0f,Math.min(1f,progress));
+            // In idle the dots cluster around the icon. During a real scan they
+            // spread outward and fade into the stippled edge of the native ring.
+            float ease=expansion*expansion*(3f-2f*expansion);
+            float inner=radius*(.82f+.42f*ease);
+            bounds.set(-inner,-inner,inner,inner);
+            paint.setAlpha(Math.round(255f*(1f-ease)));
+            if(paint.getAlpha()>1)c.drawBitmap(rest,null,bounds,paint);
+            float outer=radius*(.70f+.45f*ease);
+            bounds.set(-outer,-outer,outer,outer);
+            paint.setAlpha(Math.round(255f*ease*(.72f+.28f*q)));
+            if(paint.getAlpha()>1)c.drawBitmap(ring,null,bounds,paint);
+        }
+    }
+    private static void installHaloHook() {
+        // Hook only the bitmap draw overload used by the verified Samsung guide.
+        // ThreadLocal and exact canvas/paint identity restrict the effect to its onDraw.
+        HashSet<Method> methods=new HashSet<>();
+        for(String n:new String[]{"android.graphics.Canvas","android.graphics.BaseCanvas","android.graphics.BaseRecordingCanvas","android.graphics.RecordingCanvas","android.view.DisplayListCanvas"}){
+            try{
+                Class<?> k=Class.forName(n);
+                Method m=k.getDeclaredMethod("drawBitmap",Bitmap.class,float.class,float.class,Paint.class);
+                if(!java.lang.reflect.Modifier.isAbstract(m.getModifiers()))methods.add(m);
+            }catch(Throwable ignored){}
+        }
+        XC_MethodHook hook=new XC_MethodHook(){
+            @Override protected void beforeHookedMethod(MethodHookParam p){
+                Pass pass=drawing.get();
+                if(haloFailed||pass==null||pass.haloDrawn||pass.canvas!=p.thisObject||p.args[3]!=pass.icon||pass.halo==null)return;
+                pass.haloDrawn=true;
+                try{
+                    pass.halo.draw((Canvas)p.thisObject,pass.diameter*.5f,pass.active,pass.scanProgress);
+                }catch(Throwable t){
+                    haloFailed=true;XposedBridge.log(TAG+"dot texture disabled: "+t);
+                }
+            }
+        };
+        for(Method m:methods){
+            try{XposedBridge.hookMethod(m,hook);haloAvailable=true;}catch(Throwable ignored){}
+        }
+        XposedBridge.log(TAG+"dot texture hook available="+haloAvailable);
+    }
     // Angles begin at the right and advance clockwise in Android's local canvas.
     private static final SweepGradient RING=new SweepGradient(0,0,
         new int[]{0xff888ff1,0xff6fc2e5,0xff65b1ea,0xff5c94f9,0xff6083f0,0xff557cf0,0xff57a7fc,0xff56c2e6,0xff60cfef,0xff6abcdf,0xff8e88e8,0xff8074eb,0xff7b70e6,0xff888ff1},
@@ -48,8 +136,9 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
         f.setAccessible(true);return f;
     }
     private static final class Fields {
-        final Field state,auth,bitmap,icon,ready,progress,owner,display,talkback,register,percent,title,width,height,corner,checkPaint,checkPath;
+        final Field state,auth,bitmap,icon,ready,progress,owner,display,talkback,register,percent,title,width,height,corner,checkPaint,checkPath,currentProgress;
         Fields(Class<?> frame,Class<?> activity)throws Exception{
+            currentProgress=field(frame,"mCurrentProgress",float.class);
             state=field(frame,"mState",int.class);auth=field(frame,"mIsAuthMode",boolean.class);
             bitmap=field(frame,"mBmpFingerIcon",Bitmap.class);
             width=field(frame,"mFrameWidth",float.class);height=field(frame,"mFrameHeight",float.class);corner=field(frame,"mGuideFrameCornerSize",float.class);
@@ -69,6 +158,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
         final Paint icon,ready,progress,check,oldIcon,oldReady,oldProgress,oldCheck;
         final Bitmap original;
         final float width,height,corner;
+        Canvas canvas; DotHalo halo; float diameter,scanProgress; boolean active,haloDrawn;
         Pass(Fields f,View v)throws Exception{
             icon=(Paint)f.icon.get(v);ready=(Paint)f.ready.get(v);progress=(Paint)f.progress.get(v);
             check=(Paint)f.checkPaint.get(v);
@@ -92,6 +182,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
             Class<?> frame=Class.forName(BASE+"FingerprintEnrollGuideFrame",false,lp.classLoader);
             Class<?> activity=Class.forName(BASE+"FingerprintEnrollActivity",false,lp.classLoader);
             Fields f=new Fields(frame,activity);
+            installHaloHook();
             XposedBridge.hookMethod(frame.getDeclaredMethod("onDraw",Canvas.class),new XC_MethodHook(){
                 @Override protected void beforeHookedMethod(MethodHookParam p){
                     if(failed)return;
@@ -121,14 +212,25 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                         float diameter=Math.min(pass.width,pass.height);
                         if(!Float.isFinite(diameter)||diameter<12)throw new IllegalStateException("invalid guide size");
                         f.width.setFloat(v,diameter);f.height.setFloat(v,diameter);f.corner.setFloat(v,diameter);
+                        if(haloAvailable&&!haloFailed&&pass.original!=null){
+                            try{
+                                DotHalo halo=halos.get(v);
+                                if(halo==null){halo=new DotHalo();halos.put(v,halo);}
+                                pass.canvas=(Canvas)p.args[0];pass.halo=halo;pass.diameter=diameter;
+                                pass.active=state==2;pass.scanProgress=f.currentProgress.getFloat(v);
+                                drawing.set(pass);
+                            }catch(Throwable t){
+                                haloFailed=true; drawing.remove();XposedBridge.log(TAG+"dot texture left native: "+t);
+                            }
+                        }
                         int readyAlpha=pass.ready.getAlpha();
                         pass.ready.setColor(state==2?0xff111116:0xff09090b);pass.ready.setAlpha(state==2?readyAlpha:Math.min(readyAlpha,48));
                         int progressAlpha=pass.progress.getAlpha();
                         pass.progress.setShader(RING);pass.progress.setAlpha(progressAlpha);
                         pass.progress.setStrokeCap(Paint.Cap.ROUND);
                         // Subtle luminous edge without changing Samsung's path, stroke width or timing.
-                        float blur=Math.max(1f,pass.progress.getStrokeWidth()*.18f);
-                        pass.progress.setShadowLayer(blur,0,0,0x335f83ee);
+                        float blur=Math.max(1f,pass.progress.getStrokeWidth()*.30f);
+                        pass.progress.setShadowLayer(blur,0,0,0x505f83ee);
                         if(pass.original!=null){
                             Artwork art=cache.get(v);
                             if(art==null||art.source!=pass.original){art=new Artwork(pass.original);cache.put(v,art);}
@@ -138,11 +240,13 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                         // Original onDraw executes once, including all native timers, progress,
                         // guide translation, scale, clipping, sensor mask and invalidation.
                     }catch(Throwable t){
+                        drawing.remove();
                         if(pass!=null)try{pass.restore(f,v);}catch(Throwable ignored){}
                         p.setObjectExtra("theme-pass",null);fail(t);
                     }
                 }
                 @Override protected void afterHookedMethod(MethodHookParam p){
+                    drawing.remove();
                     Pass pass=(Pass)p.getObjectExtra("theme-pass");if(pass==null)return;
                     try{pass.restore(f,(View)p.thisObject);}catch(Throwable t){fail(t);}
                 }

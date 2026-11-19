@@ -3,6 +3,8 @@ package dev.fppulse;
 import android.app.Activity;
 import android.content.res.Configuration;
 import android.graphics.*;
+import android.animation.ValueAnimator;
+import android.os.SystemClock;
 import java.lang.reflect.Method;
 import java.util.HashSet;
 import android.view.View;
@@ -29,6 +31,11 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
         private final Bitmap rest=texture(false), ring=texture(true);
         private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
         private final RectF bounds=new RectF();
+        private long firstDraw=-1L;
+        private boolean entranceDone;
+        private float entrance=0f;
+        private boolean needsFrame;
+        float entranceIcon(){return smooth(0f,.58f,entrance);}
         private static float clamp(float x){return Math.max(0f,Math.min(1f,x));}
         private static float smooth(float start,float end,float x){
             float t=clamp((x-start)/(end-start));return t*t*(3f-2f*t);
@@ -37,37 +44,51 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
             Bitmap b=Bitmap.createBitmap(SIZE,SIZE,Bitmap.Config.ARGB_8888);
             Canvas c=new Canvas(b);
             Paint p=new Paint(Paint.ANTI_ALIAS_FLAG);
-            // A dense, staggered gray pixel field, with an elliptical falloff at rest
-            // and a wider textured annulus during the first part of a native scan.
-            for(int row=-25;row<=25;row++){
-                float yy=row*7f;
-                for(int col=-25;col<=25;col++){
-                    float xx=col*7f+((row&1)!=0?3.5f:0f);
+            // The reference has individual cool-gray dots above a subtle blue radial field.
+            // Cache both textures so no per-pixel work occurs on a live frame.
+            if(!annulus){
+                p.setShader(new RadialGradient(SIZE*.5f,SIZE*.5f,166f,
+                    new int[]{0x54242c65,0x39212b5a,0x16131b3b,0x00080b13},
+                    new float[]{0f,.48f,.78f,1f},Shader.TileMode.CLAMP));
+                c.drawCircle(SIZE*.5f,SIZE*.5f,166f,p);p.setShader(null);
+            }
+            for(int row=-29;row<=29;row++){
+                float yy=row*6f;
+                for(int col=-29;col<=29;col++){
+                    float xx=col*6f+((row&1)!=0?3f:0f);
                     float d=(float)Math.hypot(xx,yy)/160f;
                     float a;
                     if(annulus){
                         float v=(d-.91f)/.12f;
                         a=(float)Math.exp(-v*v*.5f);
                     }else{
-                        float ex=xx/104f,ey=yy/90f;
-                        a=(float)Math.exp(-(ex*ex+ey*ey)*1.10f);
+                        float v=d/.83f;
+                        a=(float)Math.exp(-v*v*.92f)*(1f-smooth(.78f,1.10f,d));
                     }
                     if(a<.035f||d>1.12f)continue;
-                    int strength=Math.round((annulus?145f:142f)*a);
-                    p.setColor(Color.argb(strength,185,185,195));
-                    c.drawCircle(SIZE/2f+xx,SIZE/2f+yy,annulus?1.28f:1.36f,p);
+                    int strength=Math.round((annulus?154f:224f)*a);
+                    p.setColor(Color.argb(strength,196,201,232));
+                    c.drawCircle(SIZE/2f+xx,SIZE/2f+yy,annulus?1.12f:1.16f,p);
                 }
             }
             return b;
         }
         void draw(Canvas c,float radius,boolean active,float progress){
-            // Idle is an explicit stable rendering, independent of any touch or elapsed time.
+            // Start only when Samsung first renders its guide, never from a fake enrollment event.
+            long now=SystemClock.uptimeMillis();
+            if(firstDraw<0)firstDraw=now;
+            if(active||!ValueAnimator.areAnimatorsEnabled())entranceDone=true;
+            entrance=entranceDone?1f:clamp((now-firstDraw)/190f);
+            if(entrance>=1f)entranceDone=true;
+            needsFrame=!entranceDone;
+            float reveal=smooth(.20f,1f,entrance);
+            // Idle pixels remain at full texture opacity after the one-shot entrance.
             float q=Float.isFinite(progress)?clamp(progress):0f;
             float spread=active?smooth(0f,.28f,q):0f;
             float dissolve=active?smooth(.44f,.94f,q):0f;
-            float inner=radius*(1.24f+.12f*spread);
+            float inner=radius*(1.19f+.12f*spread)*(.86f+.14f*reveal);
             bounds.set(-inner,-inner,inner,inner);
-            paint.setAlpha(active?Math.round(255f*(1f-spread)):255);
+            paint.setAlpha(Math.round(255f*reveal*(active?1f-spread:1f)));
             if(paint.getAlpha()>1)c.drawBitmap(rest,null,bounds,paint);
             if(active){
                 float outer=radius*(.89f+.32f*spread);
@@ -97,6 +118,12 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                     // onDraw has already updated the native per-scan progress by this point.
                     float q=pass.progressField.getFloat(pass.view);
                     pass.halo.draw((Canvas)p.thisObject,pass.diameter*.5f,pass.active,q);
+                    if(!pass.active){
+                        pass.icon.setAlpha(Math.round(pass.icon.getAlpha()*pass.halo.entranceIcon()));
+                    }
+                    if(pass.halo.needsFrame && pass.view.isShown() && pass.view.isAttachedToWindow()){
+                        pass.view.postInvalidateOnAnimation();
+                    }
                 }catch(Throwable t){
                     haloFailed=true;XposedBridge.log(TAG+"dot texture disabled: "+t);
                 }
@@ -125,7 +152,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
             Canvas c=new Canvas(b); Paint p=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
             c.drawBitmap(source,0,0,p);
             if(active)p.setShader(new LinearGradient(0,h,w*.55f,0,0xff59aefa,0xff8175ee,Shader.TileMode.CLAMP));
-            else p.setColor(0xff56565b);
+            else p.setColor(0xffb3b5cb);
             p.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_IN));
             c.drawRect(0,0,w,h,p);
             return b;

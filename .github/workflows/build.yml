@@ -1,8 +1,10 @@
-name: Build Fingerprint Pulse APK
+name: Build Fingerprint Reference APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [fingerprint-reference]
+    paths:
+      - 'app/src/main/assets/reference_assets.zip'
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,11 +29,15 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+      - name: Verify supplied reference art
+        run: |
+          test -f app/src/main/assets/reference_assets.zip
+          unzip -t app/src/main/assets/reference_assets.zip
       - run: gradle --no-daemon :app:assembleDebug
       - run: |
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk
-          cp app/build/outputs/apk/debug/app-debug.apk FingerprintPulse-beta.apk
+          cp app/build/outputs/apk/debug/app-debug.apk FingerprintPulse-reference.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: FingerprintPulse-beta
-          path: FingerprintPulse-beta.apk
+          name: FingerprintPulse-reference
+          path: FingerprintPulse-reference.apk

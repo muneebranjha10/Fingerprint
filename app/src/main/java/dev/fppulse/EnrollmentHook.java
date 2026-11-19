@@ -22,7 +22,9 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /** Native animation, theme only. Never replaces a Canvas path or an animation callback. */
-public final class EnrollmentHook implements IXposedHookLoadPackage {
+public final class EnrollmentHook implements IXposedHookLoadPackage, de.robv.android.xposed.IXposedHookZygoteInit {
+    @Override public void initZygote(de.robv.android.xposed.IXposedHookZygoteInit.StartupParam p){ReferencePack.modulePath=p.modulePath;}
+    private static final WeakHashMap<View,ReferencePack.Renderer> references=new WeakHashMap<>();
     private static final String PKG="com.samsung.android.biometrics.app.setting";
     private static final String BASE=PKG+".fingerprint.enroll.";
     private static final String TAG="FingerprintPulse native theme: ";
@@ -125,6 +127,14 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                 try{
                     // onDraw has already updated the native per-scan progress by this point.
                     float q=pass.progressField.getFloat(pass.view);
+                    if(pass.reference!=null){
+                        // Anchor the actual reference sprites to the native icon position.
+                        float cx=(Float)p.args[1]+pass.iconSize*.5f;
+                        float cy=(Float)p.args[2]+pass.iconSize*.5f;
+                        if(pass.reference.draw(pass.view,(Canvas)p.thisObject,cx,cy,pass.active,q)){
+                            pass.referenceDrawn=true;p.setResult(null);return;
+                        }
+                    }
                     pass.halo.draw((Canvas)p.thisObject,pass.diameter*.5f,pass.iconSize,pass.active,q);
                     if(!pass.active){
                         pass.icon.setAlpha(Math.round(pass.icon.getAlpha()*pass.halo.iconAlpha));
@@ -141,6 +151,33 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
             try{XposedBridge.hookMethod(m,hook);haloAvailable=true;}catch(Throwable ignored){}
         }
         XposedBridge.log(TAG+"dot texture hook available="+haloAvailable);
+    }
+    private static void installReferenceRingHooks(){
+        // Suppress only the old decorative ring after the replacement actually draws.
+        XC_MethodHook hook=new XC_MethodHook(){
+            @Override protected void beforeHookedMethod(MethodHookParam p){
+                Pass pass=drawing.get();
+                if(pass==null||!pass.referenceDrawn||p.thisObject!=pass.canvas)return;
+                Object paint=p.args[p.args.length-1];
+                if(paint==pass.ready||paint==pass.progress)p.setResult(null);
+            }
+        };
+        String[] names={"drawPath","drawCircle","drawOval","drawOval","drawRoundRect","drawRoundRect","drawArc","drawArc"};
+        Class<?>[][] args={
+            {Path.class,Paint.class},{float.class,float.class,float.class,Paint.class},
+            {RectF.class,Paint.class},{float.class,float.class,float.class,float.class,Paint.class},
+            {RectF.class,float.class,float.class,Paint.class},
+            {float.class,float.class,float.class,float.class,float.class,float.class,Paint.class},
+            {RectF.class,float.class,float.class,boolean.class,Paint.class},
+            {float.class,float.class,float.class,float.class,float.class,float.class,boolean.class,Paint.class}
+        };
+        HashSet<Method> hooked=new HashSet<>();
+        for(String type:new String[]{"android.graphics.Canvas","android.graphics.BaseCanvas","android.graphics.BaseRecordingCanvas","android.graphics.RecordingCanvas","android.view.DisplayListCanvas"}){
+            for(int i=0;i<names.length;i++)try{
+                Method m=Class.forName(type).getDeclaredMethod(names[i],args[i]);
+                if(!java.lang.reflect.Modifier.isAbstract(m.getModifiers())&&hooked.add(m))XposedBridge.hookMethod(m,hook);
+            }catch(Throwable ignored){}
+        }
     }
     // Angles begin at the right and advance clockwise in Android's local canvas.
     private static final SweepGradient RING=new SweepGradient(0,0,
@@ -201,7 +238,8 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
         final Paint icon,ready,progress,check,oldIcon,oldReady,oldProgress,oldCheck;
         final Bitmap original;
         final float width,height,corner;
-        Canvas canvas; DotHalo halo; float diameter,iconSize; boolean active,haloDrawn;
+        Canvas canvas; DotHalo halo; float diameter,iconSize; boolean active,haloDrawn,referenceDrawn;
+        ReferencePack.Renderer reference;
         View view; Field progressField;
         Pass(Fields f,View v)throws Exception{
             icon=(Paint)f.icon.get(v);ready=(Paint)f.ready.get(v);progress=(Paint)f.progress.get(v);
@@ -225,7 +263,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
         if(v instanceof Button){
             // Retain the platform button drawable and listeners.
             Button b=(Button)v;b.setTextColor(Color.WHITE);
-            b.setBackgroundTintList(ColorStateList.valueOf(0xff219cf4));
+            b.setBackgroundTintList(ColorStateList.valueOf(0xff3479f7));
         }else if(v instanceof TextView){
             ((TextView)v).setTextColor(Color.WHITE);
         }else if(v instanceof ViewGroup){
@@ -268,6 +306,9 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
             Class<?> activity=Class.forName(BASE+"FingerprintEnrollActivity",false,lp.classLoader);
             Fields f=new Fields(frame,activity);
             installHaloHook();
+            if(ReferencePack.load()){
+                installReferenceRingHooks();ReferencePack.installTutorialHook();
+            }
             // Samsung reads the skip flag in onCreate AFTER initScreen. For a fresh
             // normal add-fingerprint session, show its own registration-help page.
             XposedBridge.hookMethod(activity.getDeclaredMethod("initScreen"),new XC_MethodHook(){
@@ -287,7 +328,8 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                         Activity a=(Activity)p.thisObject;
                         if(!eligible(f,a))return;
                         themePanel(f,a,(View)f.firstGuide.get(a));
-                        tintGuide((TextureView)f.texture.get(a));
+                        if(!ReferencePack.load())tintGuide((TextureView)f.texture.get(a));
+                        else whiteOnBlack((View)f.firstGuide.get(a));
                     }catch(Throwable t){XposedBridge.log(TAG+"native tutorial theme unavailable: "+t);}
                 }
             });
@@ -307,7 +349,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                         // The real completion path is revealed by Samsung's mTimerCheckIcon.
                         // Recolor that original path, never trigger a success state or change timing.
                         if(state==4){
-                            halos.remove(v);
+                            halos.remove(v);references.remove(v);
                             RectF b=new RectF();((Path)f.checkPath.get(v)).computeBounds(b,true);
                             if(b.width()>0&&b.height()>0){
                                 int a0=pass.check.getAlpha();
@@ -328,6 +370,11 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                                 pass.canvas=(Canvas)p.args[0];pass.halo=halo;pass.diameter=diameter;
                                 pass.active=state==2;pass.progressField=f.currentProgress;pass.view=v;
                                 pass.iconSize=f.fingerIconSize.getInt(v);
+                                if(ReferencePack.load()&&pass.iconSize>0){
+                                    ReferencePack.Renderer renderer=references.get(v);
+                                    if(renderer==null){renderer=new ReferencePack.Renderer();references.put(v,renderer);}
+                                    pass.reference=renderer;
+                                }
                                 drawing.set(pass);
                             }catch(Throwable t){
                                 haloFailed=true; drawing.remove();XposedBridge.log(TAG+"dot texture left native: "+t);
@@ -378,7 +425,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
             try {
                 XposedBridge.hookMethod(View.class.getDeclaredMethod("onDetachedFromWindow"),new XC_MethodHook(){
                     @Override protected void afterHookedMethod(MethodHookParam p){
-                        if(frame.isInstance(p.thisObject)){View v=(View)p.thisObject;halos.remove(v);cache.remove(v);}
+                        if(frame.isInstance(p.thisObject)){View v=(View)p.thisObject;halos.remove(v);cache.remove(v);references.remove(v);}
                     }
                 });
             }catch(Throwable ignored){ }

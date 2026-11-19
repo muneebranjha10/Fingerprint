@@ -21,7 +21,7 @@ final class ReferencePack {
     private static Bitmap idle,ring,icon,dots;
     private static byte[] tutorial;
     private static synchronized File tutorialFile(Application app)throws IOException{
-        File target=new File(app.getCacheDir(),"fppulse_reference_tutorial_v10.mp4");
+        File target=new File(app.getCacheDir(),"fppulse_reference_tutorial_v11.mp4");
         if(target.isFile()&&target.length()==tutorial.length)return target;
         File tmp=File.createTempFile("fp_tutorial_",".mp4",app.getCacheDir());
         try{
@@ -95,62 +95,98 @@ final class ReferencePack {
     }
     static final class Renderer {
         private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
-        private final RectF box=new RectF(),arc=new RectF();
-        private final Path sector=new Path();
-        private long start=-1L,release=-1L;
+        private final Paint arcPaint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
+        private final RectF box=new RectF(),arc=new RectF(),scaled=new RectF();
+        private final Matrix transform=new Matrix();
+        private final BitmapShader ringShader=new BitmapShader(ring,Shader.TileMode.CLAMP,Shader.TileMode.CLAMP);
+        private long start=-1L,last=-1L,scanStart=-1L,release=-1L,lastChange=-1L;
         private boolean entered,wasActive;
-        private static float clamp(float v){return Math.max(0f,Math.min(1f,v));}
-        private static float smooth(float a,float b,float v){
-            float t=clamp((v-a)/(b-a));return t*t*(3-2*t);
+        private float shown,previousTarget,releasedProgress,releasedBlend;
+        Renderer(){
+            arcPaint.setStyle(Paint.Style.STROKE);
+            arcPaint.setStrokeCap(Paint.Cap.ROUND);
+            arcPaint.setShader(ringShader);
         }
-        private void bitmap(Canvas c,Bitmap b,float alpha){
-            if(alpha<=0.001f)return;
+        private static float clamp(float v){return Math.max(0f,Math.min(1f,v));}
+        private static float smooth(float a,float b,float v){float t=clamp((v-a)/(b-a));return t*t*(3-2*t);}
+        private void bitmap(Canvas c,Bitmap b,float alpha,float scale){
+            if(alpha<=.001f)return;
             paint.setAlpha(Math.round(255*clamp(alpha)));
-            c.drawBitmap(b,null,box,paint);
+            if(scale==1f){c.drawBitmap(b,null,box,paint);return;}
+            float hw=box.width()*.5f*scale,hh=box.height()*.5f*scale;
+            float x=box.centerX(),y=box.centerY();
+            scaled.set(x-hw,y-hh,x+hw,y+hh);
+            c.drawBitmap(b,null,scaled,paint);
+        }
+        private void gradientArc(Canvas c,float x,float y,float unit,float q,float alpha){
+            if(q<=.0005f||alpha<=.001f)return;
+            if(q>=.9995f){bitmap(c,ring,alpha,1f);return;}
+            // Sample the captured ring as a bitmap shader. A hardware stroked arc
+            // produces a subpixel, antialiased moving edge, with no clipPath mask.
+            transform.setScale(unit,unit);transform.postTranslate(box.left,box.top);
+            ringShader.setLocalMatrix(transform);
+            float r=120.5f*unit;
+            arc.set(x-r,y-r,x+r,y+r);
+            arcPaint.setStrokeWidth(36f*unit);
+            arcPaint.setAlpha(Math.round(clamp(alpha)*255));
+            c.drawArc(arc,-90f,360f*q,false,arcPaint);
         }
         boolean draw(View v,Canvas c,float x,float y,boolean active,float q){
             if(!loaded||!Float.isFinite(x)||!Float.isFinite(y)||!Float.isFinite(q))return false;
-            // Reference capture is 588 pixels across. The same aspect ratio is
-            // retained relative to the device display, not arbitrary icon size.
             float unit=v.getResources().getDisplayMetrics().widthPixels/588f;
             if(!Float.isFinite(unit)||unit<=.05f)return false;
-            float half=160*unit;
+            float half=160f*unit;
             long now=SystemClock.uptimeMillis();
+            float dt=last<0?16f:Math.min(64f,Math.max(1f,now-last));last=now;
             boolean anim=ValueAnimator.areAnimatorsEnabled();
-            if(start<0)start=now;if(active||!anim)entered=true;
-            float intro=entered?1f:clamp((now-start)/210f);
+            if(start<0)start=now;
+            if(active||!anim)entered=true;
+            float intro=entered?1f:clamp((now-start)/180f);
             if(intro>=1f)entered=true;
-            if(wasActive&&!active)release=now;
-            if(active)release=-1L;
-            wasActive=active;
-            float restored=!anim||release<0?1f:smooth(0,105,now-release);
-            q=clamp(q);
-            box.set(x-half,y-half,x+half,y+half);
-            if(!active){
-                bitmap(c,idle,smooth(.05f,.95f,intro)*restored);
-            }else{
-                // The captured dotted annulus remains visible on the unfilled arc.
-                float a=smooth(0,.055f,q);
-                bitmap(c,idle,1-a);
-                bitmap(c,dots,a);
-                bitmap(c,icon,a);
-                float sweep=360*q;
-                if(sweep>=359.5f)bitmap(c,ring,1f);
-                else if(sweep>.1f){
-                    // Reveal the captured gradient starting at twelve o'clock.
-                    // Round caps keep the original soft edge of the recorded ring.
-                    sector.reset();sector.moveTo(x,y);
-                    arc.set(x-half,y-half,x+half,y+half);
-                    sector.arcTo(arc,-90,sweep,false);sector.close();
-                    float r=122*unit, cap=8*unit;
-                    sector.addCircle(x,y-r,cap,Path.Direction.CW);
-                    double angle=Math.toRadians(sweep-90f);
-                    sector.addCircle(x+r*(float)Math.cos(angle),y+r*(float)Math.sin(angle),cap,Path.Direction.CW);
-                    int saved=c.save();
-                    try{c.clipPath(sector);bitmap(c,ring,1f);}finally{c.restoreToCount(saved);}
-                }
+            float target=clamp(q);
+            if(active&&!wasActive){
+                scanStart=now;shown=0;previousTarget=0;lastChange=now;release=-1L;
             }
-            if((!entered||restored<1f)&&v.isAttachedToWindow()&&v.isShown())v.postInvalidateOnAnimation();
+            if(active){
+                if(target<previousTarget-.12f){shown=0;scanStart=now;}
+                if(Math.abs(target-previousTarget)>.0005f)lastChange=now;
+                previousTarget=target;
+                // Low-latency interpolation: never display progress ahead of Samsung.
+                if(!anim||target>=.9995f)shown=target;
+                else if(target<shown)shown=target;
+                else shown+=(target-shown)*(1f-(float)Math.exp(-dt/24f));
+                if(target-shown<.0015f)shown=target;
+            }
+            if(!active&&wasActive){
+                release=now;releasedProgress=shown;releasedBlend=1f;
+            }
+            wasActive=active;
+            box.set(x-half,y-half,x+half,y+half);
+            boolean more=!entered;
+            if(active){
+                // Reference frames: brighter pixel cluster, expanding annulus,
+                // blue icon, then the clockwise ring. Native q drives the reveal.
+                float appear=anim?smooth(0f,65f,now-scanStart):1f;
+                float spread=smooth(.005f,.16f,shown);
+                float ringAlpha=smooth(0f,.018f,shown);
+                float dotAlpha=(1f-smooth(.34f,.98f,shown))*appear;
+                bitmap(c,idle,1f-appear*spread,1f-.12f*appear*(1f-spread));
+                bitmap(c,dots,dotAlpha,.67f+.33f*spread);
+                bitmap(c,icon,appear*smooth(0f,.11f,shown),1f);
+                gradientArc(c,x,y,unit,shown,ringAlpha);
+                more=anim&&(appear<1f||Math.abs(target-shown)>.001f||
+                    (shown<.999f&&lastChange>=0&&now-lastChange<180));
+            }else{
+                float fade=(!anim||release<0)?1f:smooth(0f,70f,now-release);
+                if(release>=0&&fade<1f){
+                    bitmap(c,icon,(1f-fade)*releasedBlend,1f);
+                    gradientArc(c,x,y,unit,releasedProgress,1f-fade);
+                }
+                bitmap(c,idle,smooth(.04f,.95f,intro)*fade,1f);
+                more|=fade<1f;
+            }
+            // Refresh only during a visual transition; idle does not burn frames.
+            if(more&&v.isAttachedToWindow()&&v.isShown())v.postInvalidateOnAnimation();
             return true;
         }
     }

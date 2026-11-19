@@ -3,8 +3,6 @@ on:
   workflow_dispatch:
   push:
     branches: [fingerprint-reference]
-    paths:
-      - 'app/src/main/assets/reference_assets.zip'
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,6 +31,31 @@ jobs:
         run: |
           test -f app/src/main/assets/reference_assets.zip
           unzip -t app/src/main/assets/reference_assets.zip
+      - name: Motion interpolate reference tutorial to 60 fps
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ffmpeg >/dev/null || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          z=Path('app/src/main/assets/reference_assets.zip')
+          with zipfile.ZipFile(z) as f:
+              Path('/tmp/fp-reference-input.mp4').write_bytes(f.read('tutorial.mp4'))
+          PY
+          ffmpeg -hide_banner -loglevel error -y -i /tmp/fp-reference-input.mp4 -vf 'tpad=stop_duration=0.10:stop_mode=clone,minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1' -an -c:v libx264 -preset fast -crf 17 -pix_fmt yuv420p -movflags +faststart /tmp/fp-reference-60.mp4
+          ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nw=1 /tmp/fp-reference-60.mp4
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          z=Path('app/src/main/assets/reference_assets.zip')
+          out=Path(str(z)+'.new')
+          with zipfile.ZipFile(z) as f, zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED) as g:
+              for n in f.namelist():
+                  g.writestr(n,Path('/tmp/fp-reference-60.mp4').read_bytes() if n=='tutorial.mp4' else f.read(n))
+          assert Path('/tmp/fp-reference-60.mp4').stat().st_size<4*1024*1024
+          out.replace(z)
+          PY
       - run: gradle --no-daemon :app:assembleDebug
       - run: |
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk

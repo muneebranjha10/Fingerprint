@@ -21,7 +21,7 @@ final class ReferencePack {
     private static Bitmap idle,ring,icon,dots;
     private static byte[] tutorial;
     private static synchronized File tutorialFile(Application app)throws IOException{
-        File target=new File(app.getCacheDir(),"fppulse_reference_tutorial_v11.mp4");
+        File target=new File(app.getCacheDir(),"fppulse_reference_tutorial_v12.mp4");
         if(target.isFile()&&target.length()==tutorial.length)return target;
         File tmp=File.createTempFile("fp_tutorial_",".mp4",app.getCacheDir());
         try{
@@ -94,98 +94,134 @@ final class ReferencePack {
         }catch(Throwable e){XposedBridge.log("FingerprintPulse: tutorial hook unavailable: "+e);}
     }
     static final class Renderer {
-        private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
-        private final Paint arcPaint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
-        private final RectF box=new RectF(),arc=new RectF(),scaled=new RectF();
-        private final Matrix transform=new Matrix();
-        private final BitmapShader ringShader=new BitmapShader(ring,Shader.TileMode.CLAMP,Shader.TileMode.CLAMP);
-        private long start=-1L,last=-1L,scanStart=-1L,release=-1L,lastChange=-1L;
+        // Coordinates measured in the 588px reference, centered on the native icon.
+        // Three contours traced from the recorded bright icon at its alpha midpoint.
+        private static final int[][] CONTOURS={
+            {-30,4,-31,6,-30,18,-26,29,-24,31,-24,33,-12,47,-9,49,-7,49,-5,46,-6,44,-15,36,-21,27,-25,16,-25,8,-27,4},
+            {-12,-28,-16,-26,-25,-18,-29,-11,-28,-7,-25,-7,-21,-14,-19,-15,-16,-19,-10,-23,-7,-23,-4,-25,5,-25,15,-21,23,-14,26,-9,26,-7,28,-4,28,4,25,7,22,7,19,5,17,-5,11,-12,8,-14,1,-16,-2,-16,-10,-12,-16,-5,-18,2,-18,7,-16,12,-16,16,-10,28,-2,36,3,39,13,43,19,43,21,44,23,43,23,39,21,38,15,38,5,34,-7,23,-12,10,-12,0,-9,-6,-5,-9,-2,-10,5,-9,11,-4,14,4,14,7,19,12,25,13,29,11,33,6,33,-6,31,-9,31,-12,27,-18,22,-22,21,-24,13,-28,7,-30,-6,-30,-9,-28},
+            {35,-32,24,-40,15,-44,12,-44,7,-46,-7,-46,-11,-44,-15,-44,-18,-42,-20,-42,-29,-36,-40,-23,-44,-14,-44,-11,-46,-8,-46,-1,-47,0,-46,21,-44,24,-42,33,-38,40,-35,41,-33,39,-33,37,-37,31,-37,29,-39,26,-39,22,-41,18,-41,10,-42,9,-41,-6,-39,-10,-39,-13,-35,-21,-24,-33,-13,-39,-9,-39,-5,-41,5,-41,9,-39,13,-39,16,-37,18,-37,20,-35,22,-35,36,-22,36,-20,40,-14,40,-10,42,-6,42,7,37,17,32,21,22,24,21,23,14,22,5,12,5,10,3,7,3,3,1,1,-2,2,-2,9,0,12,0,15,4,21,12,27,15,27,18,29,29,28,39,23,45,15,45,12,47,9,47,-9,45,-13,45,-16,43,-18,41,-24}
+        };
+        private final Path fingerprint=new Path();
+        private final RectF arc=new RectF(-120.5f,-120.5f,120.5f,120.5f);
+        private final Paint ink=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ringPaint=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint dotPaint=new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final LinearGradient iconShader=new LinearGradient(0,-48,0,49,
+            new int[]{0xff807cff,0xff7688fe,0xff60a7fa},null,Shader.TileMode.CLAMP);
+        private final SweepGradient ringShader=new SweepGradient(0,0,
+            new int[]{0xff6e98e7,0xff57c8ea,0xff53aae5,0xff5b8deb,0xff5c86f6,0xff5880ea,0xff589bf1,0xff58bde2,0xff66aae2,0xff7183e2,0xff7b75e9,0xff7b77e5,0xff6e98e7},null);
+        private static final int BINS=12;
+        private final float[][] points=new float[BINS][3600];
+        private final int[] counts=new int[BINS];
+        private final float[] gx=new float[1800],gy=new float[1800],rad=new float[1800],angle=new float[1800];
+        private int dotCount;
+        private long began=-1L,scanStart=-1L,release=-1L;
         private boolean entered,wasActive;
-        private float shown,previousTarget,releasedProgress,releasedBlend;
+        private float lastQ;
         Renderer(){
-            arcPaint.setStyle(Paint.Style.STROKE);
-            arcPaint.setStrokeCap(Paint.Cap.ROUND);
-            arcPaint.setShader(ringShader);
+            for(int[] a:CONTOURS){
+                int n=a.length;float lx=(a[n-2]+a[0])*.5f,ly=(a[n-1]+a[1])*.5f;
+                fingerprint.moveTo(lx,ly);
+                for(int j=0;j<n;j+=2){
+                    int k=(j+2)%n;
+                    fingerprint.quadTo(a[j],a[j+1],(a[j]+a[k])*.5f,(a[j+1]+a[k+1])*.5f);
+                }
+                fingerprint.close();
+            }
+            ink.setStyle(Paint.Style.FILL);
+            ringPaint.setStyle(Paint.Style.STROKE);ringPaint.setStrokeCap(Paint.Cap.ROUND);ringPaint.setShader(ringShader);
+            dotPaint.setStyle(Paint.Style.STROKE);dotPaint.setStrokeCap(Paint.Cap.ROUND);
+            // Measured idle lattice: about 7 reference pixels per row and column,
+            // with alternate rows offset by half a column.
+            for(int row=-20;row<=20;row++)for(int col=-20;col<=20;col++){
+                float x=col*7f+((row&1)==0?0:3.5f),y=row*7f;
+                float d=(float)Math.hypot(x,y);
+                if(d>142f||dotCount>=gx.length)continue;
+                gx[dotCount]=x;gy[dotCount]=y;rad[dotCount]=d;
+                angle[dotCount]=(float)((Math.toDegrees(Math.atan2(y,x))+450)%360);
+                dotCount++;
+            }
         }
-        private static float clamp(float v){return Math.max(0f,Math.min(1f,v));}
-        private static float smooth(float a,float b,float v){float t=clamp((v-a)/(b-a));return t*t*(3-2*t);}
-        private void bitmap(Canvas c,Bitmap b,float alpha,float scale){
+        private static float clamp(float x){return Math.max(0,Math.min(1,x));}
+        private static float smooth(float a,float b,float x){float t=clamp((x-a)/(b-a));return t*t*(3-2*t);}
+        private void pixels(Canvas c,float expansion,float q,float alpha){
+            java.util.Arrays.fill(counts,0);
+            float spread=1f+.085f*expansion;
+            for(int i=0;i<dotCount;i++){
+                float r=rad[i]*spread;
+                // Diffuse idle disk -> hollow bright annulus, with the lit arc
+                // progressively covering the dots instead of fading the entire halo.
+                float idleA=(1f-smooth(40,141,r))*.55f;
+                float band=smooth(68,93,r)*(1f-smooth(119,138,r));
+                float covered=smooth(-8f,12f,q*360f-angle[i]);
+                float a=alpha*((1-expansion)*idleA+expansion*band*.89f*(1f-.91f*covered));
+                int bin=Math.min(BINS-1,Math.round(a*(BINS-1)));
+                if(bin==0)continue;
+                int n=counts[bin];points[bin][n]=gx[i]*spread;points[bin][n+1]=gy[i]*spread;counts[bin]=n+2;
+            }
+            dotPaint.setStrokeWidth(2.0f+.68f*expansion);
+            for(int i=1;i<BINS;i++)if(counts[i]>0){
+                dotPaint.setColor(0xffc5c5d7);dotPaint.setAlpha(Math.round(i*210f/(BINS-1)));
+                c.drawPoints(points[i],0,counts[i],dotPaint);
+            }
+        }
+        private void icon(Canvas c,float active,float alpha){
             if(alpha<=.001f)return;
-            paint.setAlpha(Math.round(255*clamp(alpha)));
-            if(scale==1f){c.drawBitmap(b,null,box,paint);return;}
-            float hw=box.width()*.5f*scale,hh=box.height()*.5f*scale;
-            float x=box.centerX(),y=box.centerY();
-            scaled.set(x-hw,y-hh,x+hw,y+hh);
-            c.drawBitmap(b,null,scaled,paint);
+            ink.setShader(null);ink.setColor(0xff73737e);ink.setAlpha(Math.round(255*alpha*(1-active)));
+            if(ink.getAlpha()>0)c.drawPath(fingerprint,ink);
+            ink.setShader(iconShader);ink.setAlpha(Math.round(255*alpha*active));
+            if(ink.getAlpha()>0)c.drawPath(fingerprint,ink);
+            ink.setShader(null);
         }
-        private void gradientArc(Canvas c,float x,float y,float unit,float q,float alpha){
-            if(q<=.0005f||alpha<=.001f)return;
-            if(q>=.9995f){bitmap(c,ring,alpha,1f);return;}
-            // Sample the captured ring as a bitmap shader. A hardware stroked arc
-            // produces a subpixel, antialiased moving edge, with no clipPath mask.
-            transform.setScale(unit,unit);transform.postTranslate(box.left,box.top);
-            ringShader.setLocalMatrix(transform);
-            float r=120.5f*unit;
-            arc.set(x-r,y-r,x+r,y+r);
-            arcPaint.setStrokeWidth(36f*unit);
-            arcPaint.setAlpha(Math.round(clamp(alpha)*255));
-            c.drawArc(arc,-90f,360f*q,false,arcPaint);
+        private void ring(Canvas c,float q,float alpha){
+            if(q<=.0001f||alpha<=.001f)return;
+            // Core stroke and restrained optical edge. All curves are rendered
+            // at the destination resolution, not enlarged compressed bitmaps.
+            float sweep=360f*q;
+            ringPaint.setStrokeWidth(15f);ringPaint.setAlpha(Math.round(38*alpha));
+            c.drawArc(arc,-90,sweep,false,ringPaint);
+            ringPaint.setStrokeWidth(11f);ringPaint.setAlpha(Math.round(105*alpha));
+            c.drawArc(arc,-90,sweep,false,ringPaint);
+            ringPaint.setStrokeWidth(8.4f);ringPaint.setAlpha(Math.round(248*alpha));
+            c.drawArc(arc,-90,sweep,false,ringPaint);
         }
         boolean draw(View v,Canvas c,float x,float y,boolean active,float q){
             if(!loaded||!Float.isFinite(x)||!Float.isFinite(y)||!Float.isFinite(q))return false;
             float unit=v.getResources().getDisplayMetrics().widthPixels/588f;
             if(!Float.isFinite(unit)||unit<=.05f)return false;
-            float half=160f*unit;
             long now=SystemClock.uptimeMillis();
-            float dt=last<0?16f:Math.min(64f,Math.max(1f,now-last));last=now;
-            boolean anim=ValueAnimator.areAnimatorsEnabled();
-            if(start<0)start=now;
-            if(active||!anim)entered=true;
-            float intro=entered?1f:clamp((now-start)/180f);
+            boolean motion=ValueAnimator.areAnimatorsEnabled();
+            if(began<0)began=now;
+            if(active||!motion)entered=true;
+            float intro=entered?1f:clamp((now-began)/180f);
             if(intro>=1f)entered=true;
-            float target=clamp(q);
-            if(active&&!wasActive){
-                scanStart=now;shown=0;previousTarget=0;lastChange=now;release=-1L;
-            }
-            if(active){
-                if(target<previousTarget-.12f){shown=0;scanStart=now;}
-                if(Math.abs(target-previousTarget)>.0005f)lastChange=now;
-                previousTarget=target;
-                // Low-latency interpolation: never display progress ahead of Samsung.
-                if(!anim||target>=.9995f)shown=target;
-                else if(target<shown)shown=target;
-                else shown+=(target-shown)*(1f-(float)Math.exp(-dt/24f));
-                if(target-shown<.0015f)shown=target;
-            }
-            if(!active&&wasActive){
-                release=now;releasedProgress=shown;releasedBlend=1f;
-            }
+            q=clamp(q);
+            if(active&&!wasActive){scanStart=now;release=-1L;lastQ=0;}
+            if(active&&q<lastQ-.12f)scanStart=now;
+            if(!active&&wasActive)release=now;
             wasActive=active;
-            box.set(x-half,y-half,x+half,y+half);
             boolean more=!entered;
-            if(active){
-                // Reference frames: brighter pixel cluster, expanding annulus,
-                // blue icon, then the clockwise ring. Native q drives the reveal.
-                float appear=anim?smooth(0f,65f,now-scanStart):1f;
-                float spread=smooth(.005f,.16f,shown);
-                float ringAlpha=smooth(0f,.018f,shown);
-                float dotAlpha=(1f-smooth(.34f,.98f,shown))*appear;
-                bitmap(c,idle,1f-appear*spread,1f-.12f*appear*(1f-spread));
-                bitmap(c,dots,dotAlpha,.67f+.33f*spread);
-                bitmap(c,icon,appear*smooth(0f,.11f,shown),1f);
-                gradientArc(c,x,y,unit,shown,ringAlpha);
-                more=anim&&(appear<1f||Math.abs(target-shown)>.001f||
-                    (shown<.999f&&lastChange>=0&&now-lastChange<180));
-            }else{
-                float fade=(!anim||release<0)?1f:smooth(0f,70f,now-release);
-                if(release>=0&&fade<1f){
-                    bitmap(c,icon,(1f-fade)*releasedBlend,1f);
-                    gradientArc(c,x,y,unit,releasedProgress,1f-fade);
+            int save=c.save();
+            try{
+                c.translate(x,y);c.scale(unit,unit);
+                if(active){
+                    // Keep Samsung's per-scan progress unchanged: no low-pass delay.
+                    float expansion=motion?Math.max(smooth(0,.20f,q),smooth(0,105,now-scanStart)):1f;
+                    float tint=motion?Math.max(smooth(0,.055f,q),smooth(0,76,now-scanStart)):1f;
+                    pixels(c,expansion,q,1f);
+                    icon(c,tint,1f);
+                    ring(c,q,1f);
+                    lastQ=q;
+                    more=motion&&(expansion<1f||tint<1f);
+                }else{
+                    float fade=(!motion||release<0)?1f:smooth(0,90,now-release);
+                    float reveal=smooth(.05f,.95f,intro);
+                    pixels(c,1-fade,lastQ*(1-fade),reveal);
+                    icon(c,1-fade,reveal);
+                    if(fade<1f)ring(c,lastQ,1-fade);
+                    more|=fade<1f;
                 }
-                bitmap(c,idle,smooth(.04f,.95f,intro)*fade,1f);
-                more|=fade<1f;
-            }
-            // Refresh only during a visual transition; idle does not burn frames.
+            }finally{c.restoreToCount(save);}
             if(more&&v.isAttachedToWindow()&&v.isShown())v.postInvalidateOnAnimation();
             return true;
         }

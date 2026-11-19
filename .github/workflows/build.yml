@@ -31,7 +31,7 @@ jobs:
         run: |
           test -f app/src/main/assets/reference_assets.zip
           unzip -t app/src/main/assets/reference_assets.zip
-      - name: Motion interpolate reference tutorial to 60 fps
+      - name: Motion interpolate and restore reference tutorial detail
         shell: bash
         run: |
           set -euo pipefail
@@ -43,7 +43,7 @@ jobs:
           with zipfile.ZipFile(z) as f:
               Path('/tmp/fp-reference-input.mp4').write_bytes(f.read('tutorial.mp4'))
           PY
-          ffmpeg -hide_banner -loglevel error -y -i /tmp/fp-reference-input.mp4 -vf 'tpad=stop_duration=0.10:stop_mode=clone,minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1' -an -c:v libx264 -preset fast -crf 17 -pix_fmt yuv420p -movflags +faststart /tmp/fp-reference-60.mp4
+          ffmpeg -hide_banner -loglevel error -y -i /tmp/fp-reference-input.mp4 -vf 'tpad=stop_duration=0.10:stop_mode=clone,minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,scale=iw*2:ih*2:flags=lanczos,unsharp=5:5:0.55:5:5:0.0' -an -c:v libx264 -preset fast -crf 15 -pix_fmt yuv420p -movflags +faststart /tmp/fp-reference-60.mp4
           ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nw=1 /tmp/fp-reference-60.mp4
           python3 - <<'PY'
           import zipfile

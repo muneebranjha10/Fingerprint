@@ -2,7 +2,7 @@ plugins { id 'com.android.application' }
 android {
  namespace 'dev.fppulse'
  compileSdk 35
- defaultConfig { applicationId 'dev.fppulse'; minSdk 28; targetSdk 35; versionCode 5; versionName '0.5-native-beta' }
+ defaultConfig { applicationId 'dev.fppulse'; minSdk 28; targetSdk 35; versionCode 6; versionName '0.6-native-beta' }
  compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
  buildTypes { release { minifyEnabled false } }
 }

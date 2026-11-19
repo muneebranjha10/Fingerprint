@@ -28,73 +28,76 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
     private static boolean haloFailed;
     private static final class DotHalo {
         private static final int SIZE=384;
-        private final Bitmap rest=texture(false), ring=texture(true);
+        // Immutable shared textures. No regeneration on each enrollment/animation frame.
+        private static final Bitmap REST=texture(false), RING_PIXELS=texture(true);
         private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
         private final RectF bounds=new RectF();
-        private long firstDraw=-1L;
-        private boolean entranceDone;
-        private float entrance=0f;
-        private boolean needsFrame;
-        float entranceIcon(){return smooth(0f,.58f,entrance);}
+        private long firstDraw=-1L, release=-1L;
+        private boolean entered, wasActive, needsFrame;
+        private float iconAlpha=1f;
         private static float clamp(float x){return Math.max(0f,Math.min(1f,x));}
-        private static float smooth(float start,float end,float x){
-            float t=clamp((x-start)/(end-start));return t*t*(3f-2f*t);
+        private static float smooth(float a,float b,float x){
+            float t=clamp((x-a)/(b-a));return t*t*(3f-2f*t);
         }
-        private static Bitmap texture(boolean annulus) {
-            Bitmap b=Bitmap.createBitmap(SIZE,SIZE,Bitmap.Config.ARGB_8888);
-            Canvas c=new Canvas(b);
-            Paint p=new Paint(Paint.ANTI_ALIAS_FLAG);
-            // The reference has individual cool-gray dots above a subtle blue radial field.
-            // Cache both textures so no per-pixel work occurs on a live frame.
+        private static Bitmap texture(boolean annulus){
+            Bitmap bm=Bitmap.createBitmap(SIZE,SIZE,Bitmap.Config.ARGB_8888);
+            Canvas c=new Canvas(bm); Paint p=new Paint(Paint.ANTI_ALIAS_FLAG);
+            float mid=SIZE*.5f;
             if(!annulus){
-                p.setShader(new RadialGradient(SIZE*.5f,SIZE*.5f,166f,
-                    new int[]{0x54242c65,0x39212b5a,0x16131b3b,0x00080b13},
-                    new float[]{0f,.48f,.78f,1f},Shader.TileMode.CLAMP));
-                c.drawCircle(SIZE*.5f,SIZE*.5f,166f,p);p.setShader(null);
+                // Very dark indigo illumination, distinct bright individual pixels above it.
+                p.setShader(new RadialGradient(mid,mid,175f,
+                    new int[]{0x70212552,0x4621274d,0x1a141b39,0x00101425},
+                    new float[]{0f,.49f,.79f,1f},Shader.TileMode.CLAMP));
+                c.drawCircle(mid,mid,175f,p);p.setShader(null);
             }
-            for(int row=-29;row<=29;row++){
-                float yy=row*6f;
-                for(int col=-29;col<=29;col++){
-                    float xx=col*6f+((row&1)!=0?3f:0f);
-                    float d=(float)Math.hypot(xx,yy)/160f;
-                    float a;
-                    if(annulus){
-                        float v=(d-.91f)/.12f;
-                        a=(float)Math.exp(-v*v*.5f);
-                    }else{
-                        float v=d/.83f;
-                        a=(float)Math.exp(-v*v*.92f)*(1f-smooth(.78f,1.10f,d));
-                    }
-                    if(a<.035f||d>1.12f)continue;
-                    int strength=Math.round((annulus?154f:224f)*a);
-                    p.setColor(Color.argb(strength,196,201,232));
-                    c.drawCircle(SIZE/2f+xx,SIZE/2f+yy,annulus?1.12f:1.16f,p);
+            // Close-up at 4.4 s: roughly 30-35 visible staggered columns,
+            // not a fine noise texture or a solid glowing disc.
+            for(int row=-19;row<=19;row++){
+                float y=row*8.66f;
+                for(int col=-18;col<=18;col++){
+                    float x=col*10f+((row&1)!=0?5f:0f);
+                    float d=(float)Math.hypot(x,y)/160f;
+                    float alpha=annulus?(float)Math.exp(-.5f*Math.pow((d-.90f)/.105f,2)):
+                        (1f-smooth(.48f,1.06f,d))*(.98f-.22f*clamp(d));
+                    if(alpha<.024f||d>1.12f)continue;
+                    int strength=Math.round((annulus?185f:230f)*alpha);
+                    p.setColor(Color.argb(strength,202,207,234));
+                    c.drawCircle(mid+x,mid+y,annulus?1.75f:1.85f,p);
                 }
             }
-            return b;
+            return bm;
         }
-        void draw(Canvas c,float radius,boolean active,float progress){
-            // Start only when Samsung first renders its guide, never from a fake enrollment event.
+        void draw(Canvas c,float radius,float iconSize,boolean active,float progress){
             long now=SystemClock.uptimeMillis();
+            boolean motion=ValueAnimator.areAnimatorsEnabled();
             if(firstDraw<0)firstDraw=now;
-            if(active||!ValueAnimator.areAnimatorsEnabled())entranceDone=true;
-            entrance=entranceDone?1f:clamp((now-firstDraw)/190f);
-            if(entrance>=1f)entranceDone=true;
-            needsFrame=!entranceDone;
-            float reveal=smooth(.20f,1f,entrance);
-            // Idle pixels remain at full texture opacity after the one-shot entrance.
+            if(active||!motion)entered=true;
+            float t=entered?1f:clamp((now-firstDraw)/210f);
+            if(t>=1f)entered=true;
+            // Icon appears first; the dot field blooms immediately behind it and settles.
+            iconAlpha=smooth(0f,.32f,t);
+            float reveal=smooth(.22f,.73f,t);
+            float peak=1f+.10f*smooth(.42f,.68f,t)*(1f-smooth(.68f,1f,t));
+            if(wasActive&&!active)release=now;
+            if(active)release=-1L;
+            wasActive=active;
+            float returned=(!motion||release<0)?1f:smooth(0f,105f,now-release);
+            needsFrame=(!entered)||(!active&&returned<1f);
             float q=Float.isFinite(progress)?clamp(progress):0f;
-            float spread=active?smooth(0f,.28f,q):0f;
-            float dissolve=active?smooth(.44f,.94f,q):0f;
-            float inner=radius*(1.19f+.12f*spread)*(.86f+.14f*reveal);
+            float spread=active?smooth(.02f,.25f,q):0f;
+            float dissolve=active?smooth(.32f,.88f,q):0f;
+            // Physical proportions from the recording, measured against the native icon.
+            float base=Math.min(radius*1.13f,iconSize*1.43f);
+            if(!Float.isFinite(base)||base<6f)return;
+            float inner=base*(.82f+.18f*reveal)*peak*(1f+.12f*spread);
             bounds.set(-inner,-inner,inner,inner);
-            paint.setAlpha(Math.round(255f*reveal*(active?1f-spread:1f)));
-            if(paint.getAlpha()>1)c.drawBitmap(rest,null,bounds,paint);
+            paint.setAlpha(Math.round(255f*reveal*(active?1f-spread:returned)));
+            if(paint.getAlpha()>1)c.drawBitmap(REST,null,bounds,paint);
             if(active){
-                float outer=radius*(.89f+.32f*spread);
+                float outer=radius*(.86f+.32f*spread);
                 bounds.set(-outer,-outer,outer,outer);
                 paint.setAlpha(Math.round(255f*spread*(1f-dissolve)));
-                if(paint.getAlpha()>1)c.drawBitmap(ring,null,bounds,paint);
+                if(paint.getAlpha()>1)c.drawBitmap(RING_PIXELS,null,bounds,paint);
             }
         }
     }
@@ -117,9 +120,9 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                 try{
                     // onDraw has already updated the native per-scan progress by this point.
                     float q=pass.progressField.getFloat(pass.view);
-                    pass.halo.draw((Canvas)p.thisObject,pass.diameter*.5f,pass.active,q);
+                    pass.halo.draw((Canvas)p.thisObject,pass.diameter*.5f,pass.iconSize,pass.active,q);
                     if(!pass.active){
-                        pass.icon.setAlpha(Math.round(pass.icon.getAlpha()*pass.halo.entranceIcon()));
+                        pass.icon.setAlpha(Math.round(pass.icon.getAlpha()*pass.halo.iconAlpha));
                     }
                     if(pass.halo.needsFrame && pass.view.isShown() && pass.view.isAttachedToWindow()){
                         pass.view.postInvalidateOnAnimation();
@@ -152,7 +155,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
             Canvas c=new Canvas(b); Paint p=new Paint(Paint.ANTI_ALIAS_FLAG|Paint.FILTER_BITMAP_FLAG);
             c.drawBitmap(source,0,0,p);
             if(active)p.setShader(new LinearGradient(0,h,w*.55f,0,0xff59aefa,0xff8175ee,Shader.TileMode.CLAMP));
-            else p.setColor(0xffb3b5cb);
+            else p.setColor(0xffc4c6d7);
             p.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_IN));
             c.drawRect(0,0,w,h,p);
             return b;
@@ -164,9 +167,10 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
         f.setAccessible(true);return f;
     }
     private static final class Fields {
-        final Field state,auth,bitmap,icon,ready,progress,owner,display,talkback,register,percent,title,width,height,corner,checkPaint,checkPath,currentProgress;
+        final Field state,auth,bitmap,icon,ready,progress,owner,display,talkback,register,percent,title,width,height,corner,checkPaint,checkPath,currentProgress,fingerIconSize;
         Fields(Class<?> frame,Class<?> activity)throws Exception{
             currentProgress=field(frame,"mCurrentProgress",float.class);
+            fingerIconSize=field(frame,"mFingerIconSize",int.class);
             state=field(frame,"mState",int.class);auth=field(frame,"mIsAuthMode",boolean.class);
             bitmap=field(frame,"mBmpFingerIcon",Bitmap.class);
             width=field(frame,"mFrameWidth",float.class);height=field(frame,"mFrameHeight",float.class);corner=field(frame,"mGuideFrameCornerSize",float.class);
@@ -186,7 +190,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
         final Paint icon,ready,progress,check,oldIcon,oldReady,oldProgress,oldCheck;
         final Bitmap original;
         final float width,height,corner;
-        Canvas canvas; DotHalo halo; float diameter; boolean active,haloDrawn;
+        Canvas canvas; DotHalo halo; float diameter,iconSize; boolean active,haloDrawn;
         View view; Field progressField;
         Pass(Fields f,View v)throws Exception{
             icon=(Paint)f.icon.get(v);ready=(Paint)f.ready.get(v);progress=(Paint)f.progress.get(v);
@@ -228,6 +232,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                         // The real completion path is revealed by Samsung's mTimerCheckIcon.
                         // Recolor that original path, never trigger a success state or change timing.
                         if(state==4){
+                            halos.remove(v);
                             RectF b=new RectF();((Path)f.checkPath.get(v)).computeBounds(b,true);
                             if(b.width()>0&&b.height()>0){
                                 int a0=pass.check.getAlpha();
@@ -247,6 +252,7 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                                 if(halo==null){halo=new DotHalo();halos.put(v,halo);}
                                 pass.canvas=(Canvas)p.args[0];pass.halo=halo;pass.diameter=diameter;
                                 pass.active=state==2;pass.progressField=f.currentProgress;pass.view=v;
+                                pass.iconSize=f.fingerIconSize.getInt(v);
                                 drawing.set(pass);
                             }catch(Throwable t){
                                 haloFailed=true; drawing.remove();XposedBridge.log(TAG+"dot texture left native: "+t);
@@ -258,8 +264,8 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                         pass.progress.setShader(RING);pass.progress.setAlpha(progressAlpha);
                         pass.progress.setStrokeCap(Paint.Cap.ROUND);
                         // Subtle luminous edge without changing Samsung's path, stroke width or timing.
-                        float blur=Math.max(1f,pass.progress.getStrokeWidth()*.15f);
-                        pass.progress.setShadowLayer(blur,0,0,0x285f83ee);
+                        float blur=Math.max(1f,pass.progress.getStrokeWidth()*.12f);
+                        pass.progress.setShadowLayer(blur,0,0,0x205f83ee);
                         if(pass.original!=null){
                             Artwork art=cache.get(v);
                             if(art==null||art.source!=pass.original){art=new Artwork(pass.original);cache.put(v,art);}
@@ -293,6 +299,14 @@ public final class EnrollmentHook implements IXposedHookLoadPackage {
                     }catch(Throwable t){XposedBridge.log(TAG+"background left native: "+t);}
                 }
             });
+            // Reset a reused guide after it leaves the window; never reset on each touch.
+            try {
+                XposedBridge.hookMethod(View.class.getDeclaredMethod("onDetachedFromWindow"),new XC_MethodHook(){
+                    @Override protected void afterHookedMethod(MethodHookParam p){
+                        if(frame.isInstance(p.thisObject)){View v=(View)p.thisObject;halos.remove(v);cache.remove(v);}
+                    }
+                });
+            }catch(Throwable ignored){ }
             XposedBridge.log(TAG+"installed: original Samsung drawing and animation retained");
         }catch(Throwable t){fail(t);}
     }

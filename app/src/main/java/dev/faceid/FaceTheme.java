@@ -26,14 +26,14 @@ public final class FaceTheme implements IXposedHookLoadPackage {
     private static final String TAG="SamsungFaceID: ";
     private static boolean visualDisabled;
     private static final class Fields {
-        final Field back,inner,base,progress,scan,trace,check,mask,state,start,error,errorDone,setup,talkback,scanning,progressValue,owner;
+        final Field back,inner,base,progress,scan,trace,check,mask,state,start,error,errorDone,setup,talkback,scanning,progressValue,owner,scanStart;
         Fields(Class<?> v,Class<?> a)throws Exception{
             back=f(v,"mPntBackground");inner=f(v,"mPntInnerCircle");base=f(v,"mPntProgressBaseLine");
             progress=f(v,"mPntProgressLine");scan=f(v,"mPntScanLine");trace=f(v,"mPntTraceLine");
             check=f(v,"mPntCheckIcon");mask=f(v,"mPntGreenMask");state=f(v,"mState");
             start=f(v,"mStartingTimestamp");error=f(v,"mIsErrorStarted");errorDone=f(v,"mIsErrorFinished");
             setup=f(a,"mIsSetupWizard");talkback=f(a,"mIsTalkbackEnabled");
-            scanning=f(v,"mIsScanning");progressValue=f(v,"mProgress");owner=f(a,"mEnrollAnimationView");
+            scanning=f(v,"mIsScanning");progressValue=f(v,"mProgress");owner=f(a,"mEnrollAnimationView");scanStart=f(v,"mScanStartTimestamp");
         }
     }
     private static Field f(Class<?> k,String name)throws Exception{Field f=k.getDeclaredField(name);f.setAccessible(true);return f;}
@@ -41,7 +41,7 @@ public final class FaceTheme implements IXposedHookLoadPackage {
         final Canvas canvas;final Paint background,inner,base,progress,scan,trace,check,mask;
         final Paint[] original, copies;
         final int state; final long elapsed; final boolean error, scanning; final float progressValue;
-        boolean nested;
+        boolean nested,referenceSweep; float ringX,ringY,ringR; final long scanElapsed;
         Pass(Fields f,View v,Canvas c)throws Exception{
             canvas=c;
             background=(Paint)f.back.get(v);inner=(Paint)f.inner.get(v);base=(Paint)f.base.get(v);
@@ -51,7 +51,7 @@ public final class FaceTheme implements IXposedHookLoadPackage {
             copies=new Paint[original.length];for(int i=0;i<original.length;i++)copies[i]=new Paint(original[i]);
             state=f.state.getInt(v);elapsed=Math.max(0,SystemClock.elapsedRealtime()-f.start.getLong(v));
             error=f.error.getBoolean(v)&&!f.errorDone.getBoolean(v);
-            scanning=f.scanning.getBoolean(v);progressValue=f.progressValue.getFloat(v);
+            scanning=f.scanning.getBoolean(v);progressValue=f.progressValue.getFloat(v);scanElapsed=Math.max(0,SystemClock.elapsedRealtime()-f.scanStart.getLong(v));
         }
         void apply(){
             background.setColor(Color.BLACK);
@@ -74,15 +74,16 @@ public final class FaceTheme implements IXposedHookLoadPackage {
         }
         void ticks(Canvas c,float x,float y,float rx,float ry,float start,float sweep,int color,int alpha,float length){
             if(rx<4||ry<4||!Float.isFinite(rx)||!Float.isFinite(ry))return;
-            p.reset();p.setAntiAlias(true);p.setColor(color);p.setAlpha(alpha);p.setStrokeWidth(Math.max(1,Math.min(rx,ry)*.014f));p.setStrokeCap(Paint.Cap.ROUND);
+            p.reset();p.setAntiAlias(true);p.setColor(color);p.setAlpha(alpha);p.setStrokeWidth(Math.max(1,Math.min(rx,ry)*.013f));p.setStrokeCap(Paint.Cap.ROUND);
             int n=0;
             for(int i=0;i<64;i++){
                 float angle=-90+i*360f/64f;
                 float delta=((angle-start)%360+360)%360;
                 if(sweep<359.99f&&delta>sweep)continue;
                 double a=Math.toRadians(angle);float cos=(float)Math.cos(a),sin=(float)Math.sin(a);
-                lines[n++]=x+rx*cos*(1-length);lines[n++]=y+ry*sin*(1-length);
-                lines[n++]=x+rx*cos;lines[n++]=y+ry*sin;
+                // White and green marks share their inner endpoint; green grows outward.
+                lines[n++]=x+rx*cos*.93f;lines[n++]=y+ry*sin*.93f;
+                lines[n++]=x+rx*cos*(.93f+length);lines[n++]=y+ry*sin*(.93f+length);
             }
             if(n>0)c.drawLines(lines,0,n,p);
         }
@@ -98,44 +99,53 @@ public final class FaceTheme implements IXposedHookLoadPackage {
             }
             c.drawPath(corners,p);
         }
-        void glow(Canvas c,Path path,Paint nativePaint,boolean isTrace){
-            RectF b=rect;path.computeBounds(b,true);
-            float alpha=nativePaint.getAlpha()/255f;
-            float span=Math.max(b.width(),b.height());
-            if(span<3||!Float.isFinite(span)||alpha<=0)return;
-            float w=Math.max(1,span*.012f);
-            p.reset();p.setAntiAlias(true);p.setStyle(Paint.Style.STROKE);
-            p.setStrokeCap(Paint.Cap.ROUND);p.setStrokeJoin(Paint.Join.ROUND);
-            // Native curve motion, dim navy after-trails, tapered luminous cyan edge.
-            p.setColor(0xff0a3551);p.setAlpha(Math.round(alpha*(isTrace?65:115)));
-            p.setStrokeWidth(w*(isTrace?1.1f:3.2f));c.drawPath(path,p);
-            if(isTrace)return;
-            measure.setPath(path,false);
-            float len=measure.getLength();
-            if(len>1){
-                ribbon.reset();int count=0;
-                for(int i=0;i<=48;i++){
-                    float q=i/48f;
-                    if(!measure.getPosTan(len*q,pos,tan))continue;
-                    float taper=(float)Math.sin(Math.PI*q);
-                    float width=span*.065f*taper*taper;
-                    if(count==0)ribbon.moveTo(pos[0],pos[1]);else ribbon.lineTo(pos[0],pos[1]);
-                    edgeX[count]=pos[0]-tan[1]*width;
-                    edgeY[count]=pos[1]+tan[0]*width;
-                    count++;
+        // A projected meridian: both ends remain pinned to the same circular rim.
+        // The leading edge is bright cyan; its curved translucent trail falls away
+        // behind it. No dependence on the shape of Samsung's supplied scan paths.
+        private final Path rimClip=new Path(), curve=new Path();
+        private void meridian(Canvas c,float x,float y,float r,float bend,boolean vertical,float intensity){
+            if(intensity<=.005f)return;
+            int save=c.save();
+            try{
+                c.translate(x,y);
+                if(!vertical)c.rotate(90);
+                float k=bend*r;
+                float width=r*(.034f+.095f*Math.abs(bend));
+                float sign=bend<0?-1f:1f;
+                p.reset();p.setAntiAlias(true);
+                for(int band=8;band>=1;band--){
+                    float w=width*band/8f;
+                    ribbon.reset();ribbon.moveTo(0,-r);
+                    ribbon.cubicTo(k*1.33f,-r*.56f,k*1.33f,r*.56f,0,r);
+                    ribbon.cubicTo((k-sign*w)*1.33f,r*.56f,(k-sign*w)*1.33f,-r*.56f,0,-r);
+                    ribbon.close();
+                    p.setStyle(Paint.Style.FILL);
+                    p.setColor(band>4?0xff176791:0xff35b9e8);
+                    p.setAlpha(Math.round(intensity*(band>4?15:37)));
+                    c.drawPath(ribbon,p);
                 }
-                for(int i=count-1;i>=0;i--)ribbon.lineTo(edgeX[i],edgeY[i]);
-                ribbon.close();
-                p.setStyle(Paint.Style.FILL);
-                // A translucent ribbon, not a thick neon tube.
-                boolean vertical=b.height()>b.width();
-                float x1=b.left,y1=b.top,x2=vertical?b.right+span*.04f:b.left,y2=vertical?b.top:b.bottom+span*.04f;
-                if(x1==x2&&y1==y2)x2+=1;
-                p.setShader(new LinearGradient(x1,y1,x2,y2,
-                    new int[]{0x00103462,0x7843bce8,0xe960e9f8,0x00103560},new float[]{0,.42f,.72f,1},Shader.TileMode.CLAMP));
-                p.setAlpha(Math.round(alpha*255));c.drawPath(ribbon,p);p.setShader(null);
-            }
-            p.setStyle(Paint.Style.STROKE);p.setColor(CYAN);p.setAlpha(Math.round(alpha*215));p.setStrokeWidth(w*.83f);c.drawPath(path,p);
+                curve.reset();curve.moveTo(0,-r);
+                curve.cubicTo(k*1.33f,-r*.56f,k*1.33f,r*.56f,0,r);
+                p.setStyle(Paint.Style.STROKE);p.setStrokeWidth(Math.max(.75f,r*.0068f));p.setStrokeCap(Paint.Cap.ROUND);
+                p.setColor(0xff67d7f3);p.setAlpha(Math.round(intensity*200));
+                c.drawPath(curve,p);
+            } finally {c.restoreToCount(save);}
+        }
+        void sweep(Canvas c,float x,float y,float radius,long elapsed){
+            float r=radius*.923f;
+            if(!Float.isFinite(r)||r<8)return;
+            int save=c.save();
+            try{
+                rimClip.reset();rimClip.addCircle(x,y,r,Path.Direction.CW);c.clipPath(rimClip);
+                float phase=(elapsed%3600L)/3600f;
+                // Alternating orthogonal spherical sweeps with a short crossing interval.
+                float v=(float)Math.sin(phase*Math.PI*2);
+                float h=(float)Math.sin(phase*Math.PI*2+Math.PI*.63);
+                float vGlow=(float)Math.pow(Math.abs(Math.sin(phase*Math.PI*2+.34)),2);
+                float hGlow=(float)Math.pow(Math.abs(Math.sin(phase*Math.PI*2+Math.PI*.63+.34)),3);
+                meridian(c,x,y,r,v*.84f,true,.12f+.88f*vGlow);
+                meridian(c,x,y,r,h*.79f,false,.07f+.93f*hGlow);
+            } finally {c.restoreToCount(save);}
         }
     }
     private static final ThreadLocal<Art> arts=ThreadLocal.withInitial(Art::new);
@@ -163,7 +173,11 @@ public final class FaceTheme implements IXposedHookLoadPackage {
                                         // Native radius; the first thin white circle becomes short ticks.
                                         float q=Math.max(0,Math.min(1,(pass.elapsed-1400)/170f));
                                         if(!ValueAnimator.areAnimatorsEnabled())q=1;
-                                        art.ticks(c,x,y,r,r,-90,360,WHITE,Math.round(paint.getAlpha()*q),.038f);
+                                        pass.ringX=x;pass.ringY=y;pass.ringR=r;
+                                        art.ticks(c,x,y,r,r,-90,360,WHITE,Math.round(paint.getAlpha()*q),.041f);
+                                        if(pass.scanning&&ValueAnimator.areAnimatorsEnabled()){
+                                            art.sweep(c,x,y,r,pass.scanElapsed);pass.referenceSweep=true;
+                                        }
                                         if(q<1)art.outline(c,x,y,r,WHITE,Math.round(paint.getAlpha()*(1-q)));
                                         done=true;
                                     }
@@ -176,10 +190,17 @@ public final class FaceTheme implements IXposedHookLoadPackage {
                             }else if(kind==1&&paint==pass.progress&&pass.state==2){
                                 float l=(Float)param.args[0],t=(Float)param.args[1],r=(Float)param.args[2],b=(Float)param.args[3];
                                 float start=(Float)param.args[4],sweep=(Float)param.args[5];
-                                if(sweep>0)art.ticks(c,(l+r)*.5f,(t+b)*.5f,(r-l)*.5f,(b-t)*.5f,start,sweep,GREEN,paint.getAlpha(),.105f);
+                                if(sweep>0){
+                                    float rx=pass.ringR>0?pass.ringR:(r-l)*.5f;
+                                    float ry=pass.ringR>0?pass.ringR:(b-t)*.5f;
+                                    float x=pass.ringR>0?pass.ringX:(l+r)*.5f;
+                                    float y=pass.ringR>0?pass.ringY:(t+b)*.5f;
+                                    art.ticks(c,x,y,rx,ry,start,sweep,GREEN,paint.getAlpha(),.164f);
+                                }
                                 done=true;
                             }else if(kind==2&&(paint==pass.scan||paint==pass.trace)&&pass.state==2){
-                                art.glow(c,(Path)param.args[0],paint,paint==pass.trace);done=true;
+                                // Only suppress Samsung's decorative path if our sweep was actually drawn.
+                                done=pass.referenceSweep;
                             }else if(kind==2&&pass.state==3&&paint==pass.progress){
                                 // Real native completion path; retain position, use thin mint line.
                                 Path path=(Path)param.args[0];art.p.reset();art.p.setAntiAlias(true);art.p.setStyle(Paint.Style.STROKE);art.p.setColor(GREEN);art.p.setStrokeWidth(Math.max(1,paint.getStrokeWidth()*.38f));c.drawPath(path,art.p);done=true;
@@ -220,8 +241,8 @@ public final class FaceTheme implements IXposedHookLoadPackage {
             float q=ValueAnimator.areAnimatorsEnabled()?Math.min(1,(SystemClock.uptimeMillis()-began)/500f):1f;
             float a=q*q*(3-2*q);
             art.ticks(c,x,y,r,r,-90,360,WHITE,Math.round(255*a),.055f);
-            p.setColor(WHITE);p.setStyle(Paint.Style.STROKE);p.setStrokeCap(Paint.Cap.ROUND);p.setStrokeWidth(Math.max(1,r*.022f));p.setAlpha(Math.round(255*a));
-            float z=r*.44f;arc.set(x-z,y-z,x+z,y+z);c.drawOval(arc,p);
+            p.setColor(WHITE);p.setStyle(Paint.Style.STROKE);p.setStrokeCap(Paint.Cap.ROUND);p.setStrokeWidth(Math.max(1,r*.018f));p.setAlpha(Math.round(255*a));
+            float z=r*.38f;arc.set(x-z,y-z,x+z,y+z);c.drawOval(arc,p);
             c.drawLine(x-r*.14f,y-r*.11f,x-r*.14f,y-r*.045f,p);c.drawLine(x+r*.14f,y-r*.11f,x+r*.14f,y-r*.045f,p);
             arc.set(x-r*.16f,y+r*.015f,x+r*.16f,y+r*.20f);c.drawArc(arc,18,144,false,p);
             c.drawLine(x,y-r*.07f,x,y+r*.015f,p);
